@@ -1,0 +1,127 @@
+diff --git a/tests/formats/dataclass/test_context.py b/tests/formats/dataclass/test_context.py
+index 249bb2b..94ecc0c 100644
+--- a/tests/formats/dataclass/test_context.py
++++ b/tests/formats/dataclass/test_context.py
+@@ -1,4 +1,8 @@
+ import copy
++import sys
++import threading
++import types
++from collections.abc import Iterator
+ from dataclasses import make_dataclass
+ from pathlib import Path
+ from unittest import mock
+@@ -67,6 +71,113 @@ class XmlContextTests(FactoryTestCase):
+         self.ctx.xsi_cache["{urn:books}BookForm"].append(BooksForm)
+         self.assertEqual(BooksForm, self.ctx.find_type("{urn:books}BookForm"))
+ 
++    def test_find_type_while_another_thread_rebuilds_xsi_cache(self) -> None:
++        # Two threads rebuild the xsi cache at the same time:
++        #   1. A finishes walking the classes, B has not started yet
++        #   2. B clears the shared xsi_cache and starts walking
++        #   3. A marks the cache fresh and looks up the qname
++        #   4. While B is still walking, another lookup finds the cache fresh
++        # Every lookup must find the type, none may see B's half built cache.
++        qname = "{urn:books}BookForm"
++        self.ctx.build_xsi_cache()
++
++        get_subclasses = XmlContext.__dict__["get_subclasses"].__func__
++        a_walked, resume_a = threading.Event(), threading.Event()
++        b_walking, resume_b = threading.Event(), threading.Event()
++
++        def paused_get_subclasses(cls: type, clazz: type) -> Iterator[type]:
++            name = threading.current_thread().name
++            if clazz is object and name == "b":
++                b_walking.set()
++                resume_b.wait(5)
++
++            yield from get_subclasses(cls, clazz)
++
++            if clazz is object and name == "a":
++                a_walked.set()
++                resume_a.wait(5)
++
++        results: dict[str, type | None] = {}
++
++        def find_type() -> None:
++            results[threading.current_thread().name] = self.ctx.find_type(qname)
++
++        a = threading.Thread(target=find_type, name="a")
++        b = threading.Thread(target=find_type, name="b")
++        new_module = {"tests.lazily_imported": types.ModuleType("lazily_imported")}
++        with (
++            mock.patch.object(
++                XmlContext, "get_subclasses", classmethod(paused_get_subclasses)
++            ),
++            mock.patch.dict(sys.modules, new_module),
++        ):
++            a.start()
++            self.assertTrue(a_walked.wait(5))
++            b.start()
++            b_walking.wait(1)  # Times out if b is blocked by a, that's fine
++            resume_a.set()
++            a.join(5)
++            b_walking.wait(1)  # Times out if b didn't need to rebuild, that's fine
++            find_type()
++            resume_b.set()
++            b.join(5)
++
++        self.assertEqual(BookForm, results["a"])
++        self.assertEqual(BookForm, results["MainThread"])
++        self.assertEqual(BookForm, results["b"])
++
++    def test_find_type_while_a_new_import_triggers_a_rebuild(self) -> None:
++        # 1. A checks the cache is fresh, but hasn't looked up the qname yet
++        # 2. A module is imported, B starts a rebuild
++        # 3. A looks up the qname while B is still walking the classes
++        qname = "{urn:books}BookForm"
++        self.ctx.build_xsi_cache()
++
++        build_xsi_cache = XmlContext.build_xsi_cache
++        get_subclasses = XmlContext.__dict__["get_subclasses"].__func__
++        a_checked, resume_a = threading.Event(), threading.Event()
++        b_walking, resume_b = threading.Event(), threading.Event()
++
++        def paused_build_xsi_cache(ctx: XmlContext) -> None:
++            build_xsi_cache(ctx)
++            if threading.current_thread().name == "a":
++                a_checked.set()
++                resume_a.wait(5)
++
++        def paused_get_subclasses(cls: type, clazz: type) -> Iterator[type]:
++            if clazz is object and threading.current_thread().name == "b":
++                b_walking.set()
++                resume_b.wait(5)
++
++            yield from get_subclasses(cls, clazz)
++
++        results: dict[str, type | None] = {}
++
++        def find_type() -> None:
++            results[threading.current_thread().name] = self.ctx.find_type(qname)
++
++        a = threading.Thread(target=find_type, name="a")
++        b = threading.Thread(target=find_type, name="b")
++        new_module = {"tests.lazily_imported": types.ModuleType("lazily_imported")}
++        with (
++            mock.patch.object(XmlContext, "build_xsi_cache", paused_build_xsi_cache),
++            mock.patch.object(
++                XmlContext, "get_subclasses", classmethod(paused_get_subclasses)
++            ),
++        ):
++            a.start()
++            self.assertTrue(a_checked.wait(5))
++            with mock.patch.dict(sys.modules, new_module):
++                b.start()
++                self.assertTrue(b_walking.wait(5))
++                resume_a.set()
++                a.join(5)
++                resume_b.set()
++                b.join(5)
++
++        self.assertEqual(BookForm, results["a"])
++        self.assertEqual(BookForm, results["b"])
++
+     def test_find_type_by_fields(self) -> None:
+         field_names = {"id", "name", "sort-name"}
+         self.assertEqual(BeginArea, self.ctx.find_type_by_fields(field_names))
